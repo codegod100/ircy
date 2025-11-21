@@ -1,0 +1,27 @@
+{
+  "name": "ircy",
+  "version": "1.0.0",
+  "description": "IRC client based on IRCCloud using Cloudflare Workers and Durable Objects",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "tsc"
+  },
+  "keywords": [
+    "irc",
+    "cloudflare",
+    "workers",
+    "durable-objects"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241106.0",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.78.0"
+  },
+  "dependencies": {
+    "hono": "4.10.6"
+  }
+}

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IRCy - IRC Client</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>IRCy</h1>
+        <button class="btn-icon" id="newConnectionBtn" title="New Connection">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor">
+            <line x1="10" y1="4" x2="10" y2="16"></line>
+            <line x1="4" y1="10" x2="16" y2="10"></line>
+          </svg>
+        </button>
+      </div>
+      
+      <div class="connection-form" id="connectionForm" style="display: none;">
+        <h3>New Connection</h3>
+        <select id="serverSelect">
+          <option value="">Select a server...</option>
+          <option value="irc.libera.chat">Libera Chat (irc.libera.chat)</option>
+          <option value="irc.freenode.net">Freenode (irc.freenode.net)</option>
+          <option value="irc.efnet.org">EFnet (irc.efnet.org)</option>
+          <option value="irc.undernet.org">UnderNet (irc.undernet.org)</option>
+          <option value="irc.dal.net">DALnet (irc.dal.net)</option>
+          <option value="irc.quakenet.org">QuakeNet (irc.quakenet.org)</option>
+          <option value="custom">Custom Server...</option>
+        </select>
+        <input type="text" id="serverInput" placeholder="Server (e.g., irc.libera.chat)" required>
+        <input type="number" id="portInput" placeholder="Port (e.g., 6697)" value="6697" required>
+        <input type="text" id="nickInput" placeholder="Nickname" required>
+        <input type="text" id="usernameInput" placeholder="Username (optional)">
+        <input type="text" id="realnameInput" placeholder="Real Name (optional)">
+        <input type="password" id="passwordInput" placeholder="Password (optional)">
+        <div class="form-actions">
+          <button class="btn btn-primary" id="connectBtn">Connect</button>
+          <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
+        </div>
+      </div>
+
+      <div class="connections-list" id="connectionsList">
+        <!-- Connections will be listed here -->
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <div class="channel-list" id="channelList">
+        <!-- Channels will be listed here -->
+      </div>
+
+      <div class="chat-area" id="chatArea">
+        <div class="chat-header" id="chatHeader">
+          <h2 id="currentChannel">Not Connected</h2>
+          <div class="channel-info" id="channelInfo"></div>
+        </div>
+        
+        <div class="messages-container" id="messagesContainer">
+          <div class="welcome-message">
+            <h3>Welcome to IRCy</h3>
+            <p>Connect to an IRC server to get started</p>
+          </div>
+        </div>
+
+        <div class="input-area">
+          <input 
+            type="text" 
+            id="messageInput" 
+            placeholder="Type a message..." 
+            disabled
+            autocomplete="off"
+          >
+          <button id="sendBtn" class="btn btn-primary" disabled>Send</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
+

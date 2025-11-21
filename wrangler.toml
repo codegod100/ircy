@@ -1,0 +1,20 @@
+name = "ircy"
+main = "src/index.ts"
+compatibility_date = "2024-11-15"
+
+[durable_objects]
+bindings = [
+  { name = "IRC_CONNECTION", class_name = "IRCConnection", script_name = "ircy" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["IRCConnection"]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[env.production]
+name = "ircy"
+
