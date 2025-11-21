@@ -22,6 +22,7 @@ app.post("/api/connect", async (c) => {
     realname?: string;
     password?: string;
     connectionId?: string;
+    keepAlive?: boolean; // If true, prevents hibernation (~324k GB-s/month, within free tier)
   };
 
   // Use provided connectionId or generate one

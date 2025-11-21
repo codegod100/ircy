@@ -295,6 +295,18 @@ class IRCClient {
           console.log(`Restored ${data.messages.length} messages for channel ${data.channel}`);
         }
         break;
+      case 'userlist':
+        // Update user list for channel
+        if (data.channel && data.users && Array.isArray(data.users)) {
+          if (this.channels.has(data.channel)) {
+            const channelData = this.channels.get(data.channel);
+            channelData.users = data.users;
+            if (this.currentChannel === data.channel) {
+              this.updateUserlist(data.channel);
+            }
+          }
+        }
+        break;
       case 'error':
         this.addServerLog(`Error: ${data.error}`, 'error');
         console.error('IRC error:', data.error);
@@ -317,12 +329,13 @@ class IRCClient {
       }
       
       if (!this.channels.has(msg.channel)) {
-        this.channels.set(msg.channel, []);
+        this.channels.set(msg.channel, { messages: [], users: [] });
         this.addChannelToList(msg.channel);
       }
       
       // Check for duplicates before adding
-      const channelMessages = this.channels.get(msg.channel);
+      const channelData = this.channels.get(msg.channel);
+      const channelMessages = channelData.messages;
       const isDuplicate = channelMessages.some(existingMsg => 
         existingMsg.id === msg.id || 
         (existingMsg.user === msg.user &&
@@ -340,17 +353,32 @@ class IRCClient {
     } else if (msg.type === 'join' && msg.channel) {
       // User joined channel
       if (!this.channels.has(msg.channel)) {
-        this.channels.set(msg.channel, []);
+        this.channels.set(msg.channel, { messages: [], users: [] });
         this.addChannelToList(msg.channel);
+      }
+      const channelData = this.channels.get(msg.channel);
+      // Add user to list if not already present
+      if (msg.user && !channelData.users.includes(msg.user)) {
+        channelData.users.push(msg.user);
+        channelData.users.sort(); // Keep sorted alphabetically
       }
       // Show in channel if we're viewing it, otherwise just log
       if (this.currentChannel === msg.channel) {
         this.showMessage(`${msg.user} joined ${msg.channel}`, 'system');
+        this.updateUserlist(msg.channel);
       }
     } else if (msg.type === 'part' && msg.channel) {
       // User left channel
+      const channelData = this.channels.get(msg.channel);
+      if (channelData && msg.user) {
+        const index = channelData.users.indexOf(msg.user);
+        if (index > -1) {
+          channelData.users.splice(index, 1);
+        }
+      }
       if (this.currentChannel === msg.channel) {
         this.showMessage(`${msg.user} left ${msg.channel}`, 'system');
+        this.updateUserlist(msg.channel);
       }
     } else if (msg.type === 'nick') {
       // Nickname change - update our nickname if it's us
@@ -586,11 +614,14 @@ class IRCClient {
       document.getElementById('channelInfo').textContent = 'IRC protocol messages and connection status';
       document.getElementById('messageInput').disabled = true;
       document.getElementById('sendBtn').disabled = true;
+      document.getElementById('userlistContainer').style.display = 'none';
     } else {
       document.getElementById('currentChannel').textContent = channel;
       document.getElementById('channelInfo').textContent = '';
       document.getElementById('messageInput').disabled = false;
       document.getElementById('sendBtn').disabled = false;
+      document.getElementById('userlistContainer').style.display = 'block';
+      this.updateUserlist(channel);
     }
     
     // Update active channel
@@ -600,12 +631,29 @@ class IRCClient {
         item.classList.add('active');
       }
     });
-
+    
     // Load messages for this channel
     if (channel === '__SERVER_LOG__') {
       this.loadServerLog();
     } else {
       this.loadChannelMessages(channel);
+    }
+  }
+
+  updateUserlist(channel) {
+    const userlistContainer = document.getElementById('userlist');
+    userlistContainer.innerHTML = '';
+    
+    if (this.channels.has(channel)) {
+      const channelData = this.channels.get(channel);
+      if (channelData && channelData.users && Array.isArray(channelData.users)) {
+        channelData.users.forEach(user => {
+          const userEl = document.createElement('div');
+          userEl.className = 'user-item';
+          userEl.textContent = user;
+          userlistContainer.appendChild(userEl);
+        });
+      }
     }
   }
 
@@ -748,7 +796,7 @@ class IRCClient {
     if (state.channels) {
       state.channels.forEach(channel => {
         if (!this.channels.has(channel.name)) {
-          this.channels.set(channel.name, []);
+          this.channels.set(channel.name, { messages: [], users: channel.users || [] });
           this.addChannelToList(channel.name);
         }
       });

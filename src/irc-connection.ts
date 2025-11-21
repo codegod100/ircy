@@ -19,7 +19,7 @@ export interface IRCChannel {
 
 export interface IRCSocket {
   send: (data: string) => Promise<void>;
-  close: () => void;
+  close: () => Promise<void>;
 }
 
 export interface IRCConnectionState {
@@ -34,6 +34,7 @@ export interface IRCConnectionState {
   buffer: IRCMessage[];
   socket?: IRCSocket;
   lastActivity: number;
+  keepAlive?: boolean; // If true, use alarms to prevent hibernation (costs ~$410/month)
 }
 
 interface Env {
@@ -80,6 +81,23 @@ export class IRCConnection {
     }
   }
 
+  // Durable Object alarm handler - called when alarm fires
+  // This prevents hibernation to keep IRC connection alive for bouncer functionality
+  async alarm(): Promise<void> {
+    await this.ensureStateLoaded();
+    
+    // If IRC is connected, schedule next alarm to prevent hibernation
+    // This keeps the Durable Object alive so IRC connection persists
+    if (this.state?.connected) {
+      // Schedule next alarm in 20 seconds (before 30s hibernation threshold)
+      const nextAlarm = Date.now() + 20000;
+      await this.ctx.storage.setAlarm(nextAlarm);
+      console.log('Alarm: IRC still connected, scheduling next alarm to prevent hibernation');
+    } else {
+      console.log('Alarm: IRC not connected, not scheduling next alarm');
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -108,6 +126,7 @@ export class IRCConnection {
     return new Response("Not Found", { status: 404 });
   }
 
+
   private async handleWebSocket(request: Request): Promise<Response> {
     // Ensure state is loaded before handling WebSocket
     await this.ensureStateLoaded();
@@ -120,7 +139,7 @@ export class IRCConnection {
     console.log(`WebSocket added. Total WebSockets: ${this.websockets.size}`);
 
     // If we have a connection request pending and this is the first WebSocket, start IRC connection
-    // Also reconnect if IRC connection was lost
+    // Also reconnect if IRC connection was lost (e.g., after Durable Object hibernation)
     if (this.state && !this.state.connected && this.websockets.size === 1) {
       // Reset connection started flag if connection was lost
       if (!this.state.connected) {
@@ -128,7 +147,7 @@ export class IRCConnection {
       }
       
       if (!this.ircConnectionStarted) {
-        console.log('First WebSocket connected, starting IRC connection now');
+        console.log('First WebSocket connected, starting IRC connection now (reconnecting after hibernation if needed)');
         this.ircConnectionStarted = true;
         this.connectToIRC().catch((error) => {
           this.broadcast({ type: "error", error: String(error) });
@@ -136,10 +155,15 @@ export class IRCConnection {
         });
       }
     }
+    
+    // If IRC is already connected, we're good (Durable Object didn't hibernate)
+    // If not connected, the above logic will reconnect
 
     server.addEventListener("close", () => {
       this.websockets.delete(server);
       console.log(`WebSocket removed. Total WebSockets: ${this.websockets.size}`);
+      // Note: IRC connection stays open even when all clients disconnect
+      // It will only close if the Durable Object hibernates or there's an error
     });
 
     server.addEventListener("error", () => {
@@ -158,11 +182,13 @@ export class IRCConnection {
       for (const [channelName, channel] of this.state.channels.entries()) {
         const messages = channel.messages || [];
         console.log(`Sending ${messages.length} messages for channel ${channelName}`, messages.map(m => ({ id: m.id, user: m.user, message: m.message?.substring(0, 20) })));
-        // Send channel history restoration message
+        // Send channel history restoration message with users
         server.send(JSON.stringify({
           type: "channel_history",
           channel: channelName,
           messages: messages.slice(-500), // Send last 500 messages per channel
+          users: channel.users || [], // Send user list
+          topic: channel.topic,
         }));
       }
 
@@ -201,6 +227,7 @@ export class IRCConnection {
         username?: string;
         realname?: string;
         password?: string;
+        keepAlive?: boolean; // If true, prevents hibernation (~324k GB-s/month, within free tier)
       };
 
       // Load state from storage
@@ -263,9 +290,17 @@ export class IRCConnection {
 
   private async handleDisconnect(request: Request): Promise<Response> {
     if (this.state?.socket) {
-      this.state.socket.close();
+      await this.state.socket.close();
       this.state.socket = undefined;
     }
+    
+    // Cancel alarms since we're disconnecting
+    try {
+      await this.ctx.storage.deleteAlarm();
+    } catch (e) {
+      // Ignore if no alarm exists
+    }
+    
     this.state = null;
     await this.ctx.storage.deleteAll();
 
@@ -422,6 +457,28 @@ export class IRCConnection {
       await this.sendIRC(`USER ${this.state.username} 0 * :${this.state.realname}`);
 
       this.broadcast({ type: "connected", message: "Connected to IRC server" });
+      
+      // Auto-join channels that were previously joined
+      if (this.state.channels.size > 0) {
+        console.log(`Auto-joining ${this.state.channels.size} channels`);
+        for (const channelName of this.state.channels.keys()) {
+          await this.sendIRC(`JOIN ${channelName}`);
+          // Small delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      
+      // Schedule alarm to prevent hibernation ONLY if keepAlive is enabled
+      // A single 24/7 connection uses ~324k GB-s/month (within 400k free tier = $0/month)
+      // See: https://developers.cloudflare.com/durable-objects/platform/pricing/
+      if (this.state.keepAlive) {
+        const nextAlarm = Date.now() + 20000;
+        await this.ctx.storage.setAlarm(nextAlarm);
+        console.log('IRC connected with keepAlive enabled, scheduled alarm to prevent hibernation');
+      } else {
+        console.log('IRC connected without keepAlive - will hibernate after ~30s of inactivity (messages may be lost)');
+      }
+      
       this.saveState();
 
       // Read messages from socket (don't await - run in background)
@@ -435,16 +492,28 @@ export class IRCConnection {
       });
 
       // Handle socket closure
-      socket.closed.then(() => {
+      socket.closed.then(async () => {
         console.log("Socket closed");
         this.state!.connected = false;
         this.ircConnectionStarted = false; // Reset flag so we can reconnect when WebSocket reconnects
+        // Cancel alarms since IRC disconnected
+        try {
+          await this.ctx.storage.deleteAlarm();
+        } catch (e) {
+          // Ignore if no alarm exists
+        }
         this.broadcast({ type: "disconnected", message: "Disconnected from IRC server" });
         this.saveState();
-      }).catch((error) => {
+      }).catch(async (error) => {
         console.error("Socket closed with error:", error);
         this.state!.connected = false;
         this.ircConnectionStarted = false; // Reset flag so we can reconnect when WebSocket reconnects
+        // Cancel alarms since IRC disconnected
+        try {
+          await this.ctx.storage.deleteAlarm();
+        } catch (e) {
+          // Ignore if no alarm exists
+        }
         this.broadcast({ type: "error", error: `Socket closed: ${String(error)}` });
         this.broadcast({ type: "disconnected", message: "Disconnected from IRC server" });
         this.saveState();
@@ -531,6 +600,65 @@ export class IRCConnection {
           this.state.buffer.shift();
         }
 
+        // Handle JOIN/PART messages to update user lists
+        if (message.type === "join" && message.channel && message.user) {
+          if (!this.state.channels.has(message.channel)) {
+            this.state.channels.set(message.channel, {
+              name: message.channel,
+              messages: [],
+              users: [],
+            });
+            // Save state when new channel is created
+            this.state.lastActivity = Date.now();
+            this.saveState().catch(err => {
+              console.error('Error saving state after channel join:', err);
+            });
+          }
+          const channel = this.state.channels.get(message.channel)!;
+          if (!channel.users.includes(message.user)) {
+            channel.users.push(message.user);
+            channel.users.sort();
+            // Broadcast user list update
+            this.broadcast({ 
+              type: "userlist", 
+              channel: message.channel,
+              users: channel.users 
+            });
+          }
+          // Broadcast JOIN message so frontend can add channel to UI
+          this.broadcast({ type: "message", message: message });
+        } else if (message.type === "part" && message.channel && message.user) {
+          if (this.state.channels.has(message.channel)) {
+            const channel = this.state.channels.get(message.channel)!;
+            const index = channel.users.indexOf(message.user);
+            if (index > -1) {
+              channel.users.splice(index, 1);
+              // Broadcast user list update
+              this.broadcast({ 
+                type: "userlist", 
+                channel: message.channel,
+                users: channel.users 
+              });
+            }
+          }
+          // Broadcast PART message so frontend can update UI
+          this.broadcast({ type: "message", message: message });
+        } else if (message.type === "quit" && message.user) {
+          // Remove user from all channels
+          for (const [channelName, channel] of this.state.channels.entries()) {
+            const index = channel.users.indexOf(message.user);
+            if (index > -1) {
+              channel.users.splice(index, 1);
+              // Broadcast user list update
+              this.broadcast({ 
+                type: "userlist", 
+                channel: channelName,
+                users: channel.users 
+              });
+            }
+          }
+        }
+
         // Add to channel if applicable
         if (message.channel) {
           if (!this.state.channels.has(message.channel)) {
@@ -542,61 +670,64 @@ export class IRCConnection {
           }
           const channel = this.state.channels.get(message.channel)!;
           
-          // Check if this is a duplicate (server echo of optimistic message)
-          // Look for optimistic message with same content and user within last 5 seconds
-          let replacedOptimistic = false;
-          let shouldBroadcast = true;
-          
-          for (let idx = channel.messages.length - 1; idx >= 0; idx--) {
-            const existingMsg = channel.messages[idx];
-            if (existingMsg.id?.startsWith('optimistic-') && 
+          // Only add messages (not JOIN/PART/QUIT) to message list
+          if (message.type === "message") {
+            // Check if this is a duplicate (server echo of optimistic message)
+            // Look for optimistic message with same content and user within last 5 seconds
+            let replacedOptimistic = false;
+            let shouldBroadcast = true;
+            
+            for (let idx = channel.messages.length - 1; idx >= 0; idx--) {
+              const existingMsg = channel.messages[idx];
+              if (existingMsg.id?.startsWith('optimistic-') && 
+                  existingMsg.user === message.user &&
+                  existingMsg.message === message.message &&
+                  Math.abs(existingMsg.timestamp - message.timestamp) < 5000) {
+                // Replace optimistic message with server echo
+                channel.messages[idx] = message;
+                replacedOptimistic = true;
+                shouldBroadcast = false; // Don't broadcast duplicate
+                break;
+              }
+            }
+            
+            if (!replacedOptimistic) {
+              // Only add if not a duplicate of any existing message
+              const isDuplicate = channel.messages.some(existingMsg => 
                 existingMsg.user === message.user &&
                 existingMsg.message === message.message &&
-                Math.abs(existingMsg.timestamp - message.timestamp) < 5000) {
-              // Replace optimistic message with server echo
-              channel.messages[idx] = message;
-              replacedOptimistic = true;
-              shouldBroadcast = false; // Don't broadcast duplicate
-              break;
-            }
-          }
-          
-          if (!replacedOptimistic) {
-            // Only add if not a duplicate of any existing message
-            const isDuplicate = channel.messages.some(existingMsg => 
-              existingMsg.user === message.user &&
-              existingMsg.message === message.message &&
-              Math.abs(existingMsg.timestamp - message.timestamp) < 2000
-            );
-            
-            if (!isDuplicate) {
-              channel.messages.push(message);
-              if (channel.messages.length > 1000) {
-                channel.messages.shift();
+                Math.abs(existingMsg.timestamp - message.timestamp) < 2000
+              );
+              
+              if (!isDuplicate) {
+                channel.messages.push(message);
+                if (channel.messages.length > 1000) {
+                  channel.messages.shift();
+                }
+              } else {
+                shouldBroadcast = false; // Don't broadcast duplicate
               }
-            } else {
-              shouldBroadcast = false; // Don't broadcast duplicate
             }
-          }
-          
-          console.log(`Added message to channel ${message.channel}, total messages: ${channel.messages.length}`, {
-            user: message.user,
-            message: message.message?.substring(0, 30),
-            id: message.id,
-            replacedOptimistic
-          });
-          
-          // Save state immediately for channel messages to ensure persistence
-          this.state.lastActivity = Date.now();
-          this.saveState().then(() => {
-            console.log(`State saved after adding message to ${message.channel}, channel now has ${channel.messages.length} messages`);
-          }).catch(err => {
-            console.error('Error saving state:', err);
-          });
-          
-          // Broadcast only if not a duplicate
-          if (shouldBroadcast) {
-            this.broadcast({ type: "message", message: message });
+            
+            console.log(`Added message to channel ${message.channel}, total messages: ${channel.messages.length}`, {
+              user: message.user,
+              message: message.message?.substring(0, 30),
+              id: message.id,
+              replacedOptimistic
+            });
+            
+            // Save state immediately for channel messages to ensure persistence
+            this.state.lastActivity = Date.now();
+            this.saveState().then(() => {
+              console.log(`State saved after adding message to ${message.channel}, channel now has ${channel.messages.length} messages`);
+            }).catch(err => {
+              console.error('Error saving state:', err);
+            });
+            
+            // Broadcast only if not a duplicate
+            if (shouldBroadcast) {
+              this.broadcast({ type: "message", message: message });
+            }
           }
         } else {
           this.state.lastActivity = Date.now();
@@ -721,6 +852,27 @@ export class IRCConnection {
             if (!chan.users.includes(cleanUser)) {
               chan.users.push(cleanUser);
             }
+          });
+          // Broadcast user list update
+          this.broadcast({ 
+            type: "userlist", 
+            channel: channel,
+            users: chan.users 
+          });
+        }
+        return null;
+
+      case "366": // RPL_ENDOFNAMES - end of user list
+        // User list is complete, sort it
+        const endChannel = paramParts[1];
+        if (endChannel && this.state?.channels.has(endChannel)) {
+          const chan = this.state.channels.get(endChannel)!;
+          chan.users.sort();
+          // Broadcast final user list
+          this.broadcast({ 
+            type: "userlist", 
+            channel: endChannel,
+            users: chan.users 
           });
         }
         return null;
