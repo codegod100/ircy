@@ -9,7 +9,7 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["IRCConnection"]
+new_sqlite_classes = ["IRCConnection"]
 
 [assets]
 directory = "./public"

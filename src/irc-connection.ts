@@ -29,12 +29,23 @@ export interface IRCConnectionState {
   username?: string;
   realname?: string;
   password?: string;
+  sasl?: {
+    mechanism: string; // "PLAIN", "EXTERNAL", etc.
+    username?: string;
+    password?: string;
+  };
   connected: boolean;
   channels: Map<string, IRCChannel>;
   buffer: IRCMessage[];
   socket?: IRCSocket;
   lastActivity: number;
   keepAlive?: boolean; // If true, use alarms to prevent hibernation (costs ~$410/month)
+  capNegotiation?: {
+    enabled: boolean;
+    saslRequested: boolean;
+    saslAccepted: boolean;
+    waitingForAuthenticate: boolean;
+  };
 }
 
 interface Env {
@@ -227,6 +238,11 @@ export class IRCConnection {
         username?: string;
         realname?: string;
         password?: string;
+        sasl?: {
+          mechanism: string;
+          username?: string;
+          password?: string;
+        };
         keepAlive?: boolean; // If true, prevents hibernation (~324k GB-s/month, within free tier)
       };
 
@@ -263,11 +279,17 @@ export class IRCConnection {
           username: body.username || body.nick,
           realname: body.realname || body.nick,
           password: body.password,
+          sasl: body.sasl,
           connected: false,
           channels: new Map(),
           buffer: [],
           lastActivity: Date.now(),
         };
+      }
+
+      // Update SASL if provided (even if state was loaded)
+      if (body.sasl) {
+        this.state.sasl = body.sasl;
       }
 
       // Mark that we want to connect to IRC
@@ -449,14 +471,36 @@ export class IRCConnection {
 
       this.broadcast({ type: "status", message: "TCP connection established, authenticating..." });
 
-      // Send authentication
-      if (this.state.password) {
-        await this.sendIRC(`PASS ${this.state.password}`);
+      // Initialize CAP negotiation state if using SASL
+      if (this.state.sasl) {
+        this.state.capNegotiation = {
+          enabled: true,
+          saslRequested: false,
+          saslAccepted: false,
+          waitingForAuthenticate: false,
+        };
+        // Request CAP LS to see what capabilities are available
+        await this.sendIRC("CAP LS 302");
+        
+        // Set a timeout to complete authentication if CAP negotiation stalls
+        setTimeout(() => {
+          if (this.state?.capNegotiation?.enabled && !this.state.capNegotiation.saslAccepted) {
+            console.log("CAP negotiation timeout - ending CAP and completing authentication");
+            this.sendIRC("CAP END");
+            this.state.capNegotiation.enabled = false;
+            this.completeAuthentication();
+          }
+        }, 10000); // 10 second timeout
+      } else {
+        // Traditional authentication without SASL
+        // Don't send CAP LS - just authenticate directly
+        if (this.state.password) {
+          await this.sendIRC(`PASS ${this.state.password}`);
+        }
+        await this.sendIRC(`NICK ${this.state.nick}`);
+        await this.sendIRC(`USER ${this.state.username || this.state.nick} 0 * :${this.state.realname || this.state.nick}`);
+        this.broadcast({ type: "connected", message: "Connected to IRC server" });
       }
-      await this.sendIRC(`NICK ${this.state.nick}`);
-      await this.sendIRC(`USER ${this.state.username} 0 * :${this.state.realname}`);
-
-      this.broadcast({ type: "connected", message: "Connected to IRC server" });
       
       // Auto-join channels that were previously joined
       if (this.state.channels.size > 0) {
@@ -590,6 +634,32 @@ export class IRCConnection {
       // Log all incoming IRC messages for debugging
       if (line.includes("PRIVMSG")) {
         console.log("IRC raw received (PRIVMSG):", line);
+      }
+
+      // Handle CAP and AUTHENTICATE commands before parsing
+      // CAP messages can be :server CAP * LS :... or CAP * LS :...
+      // Check if line contains CAP command by splitting and checking
+      const parts = line.split(" ");
+      const capIndex = parts.findIndex(p => p === "CAP");
+      if (capIndex >= 0) {
+        console.log(`Found CAP at index ${capIndex}, parts:`, parts);
+        if (capIndex + 2 < parts.length) {
+          const subcommand = parts[capIndex + 2];
+          console.log(`CAP subcommand: ${subcommand}`);
+          if (["LS", "ACK", "NAK", "LIST", "END"].includes(subcommand)) {
+            console.log("Handling CAP message:", line);
+            this.handleCAP(line);
+            continue;
+          }
+        } else {
+          console.log(`CAP found but not enough parts (capIndex=${capIndex}, parts.length=${parts.length})`);
+        }
+      }
+      // AUTHENTICATE can be :server AUTHENTICATE + or AUTHENTICATE +
+      if (line.includes("AUTHENTICATE")) {
+        console.log("Handling AUTHENTICATE message:", line);
+        this.handleAUTHENTICATE(line);
+        continue;
       }
 
       const message = this.parseIRCMessage(line);
@@ -743,6 +813,132 @@ export class IRCConnection {
     }
   }
 
+  private handleCAP(line: string): void {
+    if (!this.state || !this.state.capNegotiation) {
+      console.log("handleCAP called but capNegotiation not initialized");
+      return;
+    }
+
+    // Parse CAP message: :server CAP * LS :sasl multi-prefix ...
+    // Format can be: :server CAP * LS or CAP * LS
+    const parts = line.split(" ");
+    const capIndex = parts.findIndex(p => p === "CAP");
+    if (capIndex < 0 || capIndex + 2 >= parts.length) {
+      console.error("Invalid CAP message format:", line);
+      return;
+    }
+    const subcommand = parts[capIndex + 2]; // LS, ACK, NAK, LIST, etc. (2 positions after CAP)
+    
+    // Extract capabilities string (everything after the last ":")
+    const lastColonIndex = line.lastIndexOf(" :");
+    const capabilitiesStr = lastColonIndex >= 0 ? line.substring(lastColonIndex + 2) : "";
+    const capabilities = capabilitiesStr.split(" ").filter(c => c.length > 0);
+
+    console.log(`CAP ${subcommand}:`, capabilities);
+    console.log(`CAP capabilities string: "${capabilitiesStr}"`);
+
+    // Helper to check if SASL is available (can be "sasl" or "sasl=PLAIN,EXTERNAL,...")
+    const hasSASL = capabilities.some(cap => cap.startsWith("sasl"));
+
+    if (subcommand === "LS") {
+      // Server sent capability list
+      console.log(`CAP LS: hasSASL=${hasSASL}, this.state.sasl=`, this.state.sasl);
+      if (hasSASL && this.state.sasl && this.state.sasl.username && this.state.sasl.password) {
+        // Request SASL capability
+        console.log("SASL detected and configured, requesting capability");
+        this.sendIRC("CAP REQ :sasl");
+        this.state.capNegotiation.saslRequested = true;
+      } else {
+        // No SASL support, not configured, or missing credentials - proceed with normal auth
+        if (hasSASL && this.state.sasl && (!this.state.sasl.username || !this.state.sasl.password)) {
+          console.log("SASL configured but missing credentials, ending CAP");
+        } else if (hasSASL && !this.state.sasl) {
+          console.log("Server supports SASL but not configured, ending CAP");
+        } else {
+          console.log("No SASL support, ending CAP");
+        }
+        this.sendIRC("CAP END");
+        this.state.capNegotiation.enabled = false;
+        this.completeAuthentication();
+      }
+    } else if (subcommand === "ACK") {
+      // Server acknowledged our capability request
+      if (hasSASL) {
+        this.state.capNegotiation.saslAccepted = true;
+        console.log("SASL capability accepted, starting authentication");
+        // Start SASL authentication
+        if (this.state.sasl?.mechanism === "PLAIN") {
+          this.sendIRC("AUTHENTICATE PLAIN");
+          this.state.capNegotiation.waitingForAuthenticate = true;
+        }
+      } else {
+        // SASL not in ACK, end CAP and proceed
+        console.log("SASL not in ACK, ending CAP");
+        this.sendIRC("CAP END");
+        this.state.capNegotiation.enabled = false;
+        this.completeAuthentication();
+      }
+    } else if (subcommand === "NAK") {
+      // Server rejected our capability request
+      console.log("SASL capability rejected, falling back to normal auth");
+      this.sendIRC("CAP END");
+      this.state.capNegotiation.enabled = false;
+      this.completeAuthentication();
+    }
+  }
+
+  private handleAUTHENTICATE(line: string): void {
+    if (!this.state || !this.state.capNegotiation || !this.state.sasl) return;
+
+    const parts = line.split(" ");
+    const response = parts[1];
+
+    if (response === "+") {
+      // Server is ready for authentication data
+      if (this.state.sasl.mechanism === "PLAIN" && this.state.sasl.username && this.state.sasl.password) {
+        // Encode credentials: \0username\0password in base64
+        const credentials = `\0${this.state.sasl.username}\0${this.state.sasl.password}`;
+        const encoded = btoa(credentials);
+        // AUTHENTICATE can only send 400 bytes at a time, so split if needed
+        if (encoded.length <= 400) {
+          this.sendIRC(`AUTHENTICATE ${encoded}`);
+        } else {
+          // Send in chunks (shouldn't happen for normal credentials, but handle it)
+          const chunk1 = encoded.substring(0, 400);
+          this.sendIRC(`AUTHENTICATE ${chunk1}`);
+          // Remaining chunks would be sent in subsequent AUTHENTICATE + responses
+        }
+        console.log("Sent SASL PLAIN authentication");
+      }
+    } else if (response === "903" || response === "904" || response === "905" || response === "906" || response === "907") {
+      // SASL authentication result
+      // 903 = success, 904-907 = various failures
+      if (response === "903") {
+        console.log("SASL authentication successful");
+        // End CAP negotiation and complete authentication
+        this.sendIRC("CAP END");
+        this.state.capNegotiation.enabled = false;
+        this.completeAuthentication();
+      } else {
+        console.error(`SASL authentication failed: ${response}`);
+        this.broadcast({ type: "error", error: `SASL authentication failed: ${response}` });
+        // End CAP negotiation anyway
+        this.sendIRC("CAP END");
+        this.state.capNegotiation.enabled = false;
+        this.completeAuthentication();
+      }
+    }
+  }
+
+  private completeAuthentication(): void {
+    if (!this.state) return;
+
+    // Send NICK and USER commands
+    this.sendIRC(`NICK ${this.state.nick}`);
+    this.sendIRC(`USER ${this.state.username || this.state.nick} 0 * :${this.state.realname || this.state.nick}`);
+    this.broadcast({ type: "connected", message: "Connected to IRC server" });
+  }
+
   private parseIRCMessage(line: string): IRCMessage | null {
     const id = `${Date.now()}-${Math.random()}`;
     const timestamp = Date.now();
@@ -822,7 +1018,62 @@ export class IRCConnection {
           raw: line,
         };
 
+      case "903": // RPL_SASLSUCCESS - SASL authentication successful
+        if (this.state?.capNegotiation?.enabled && this.state.capNegotiation.waitingForAuthenticate) {
+          console.log("SASL authentication successful (903)");
+          // End CAP negotiation and complete authentication
+          this.sendIRC("CAP END");
+          this.state.capNegotiation.enabled = false;
+          this.state.capNegotiation.waitingForAuthenticate = false;
+          this.completeAuthentication();
+        }
+        return {
+          id,
+          timestamp,
+          type: "notice",
+          message: trailing,
+          raw: line,
+        };
+      case "904": // ERR_SASLFAIL - SASL authentication failed
+      case "905": // ERR_SASLTOOLONG - SASL message too long
+      case "906": // ERR_SASLABORTED - SASL authentication aborted
+      case "907": // ERR_SASLALREADY - SASL authentication already completed
+        if (this.state?.capNegotiation?.enabled) {
+          console.error(`SASL authentication failed: ${command}`);
+          this.broadcast({ type: "error", error: `SASL authentication failed: ${command} - ${trailing}` });
+          // End CAP negotiation anyway
+          this.sendIRC("CAP END");
+          this.state.capNegotiation.enabled = false;
+          this.state.capNegotiation.waitingForAuthenticate = false;
+          this.completeAuthentication();
+        }
+        return {
+          id,
+          timestamp,
+          type: "error",
+          message: trailing,
+          raw: line,
+        };
       case "001": // RPL_WELCOME
+        // After welcome, if we're using SASL and haven't completed auth, something went wrong
+        // Complete authentication anyway to avoid being stuck
+        if (this.state?.capNegotiation?.enabled) {
+          console.log("Received 001 (RPL_WELCOME) but CAP negotiation still active, completing auth");
+          if (!this.state.capNegotiation.saslAccepted) {
+            // SASL wasn't completed, end CAP and complete normal authentication
+            console.log("Ending CAP negotiation and completing authentication");
+            this.sendIRC("CAP END");
+            this.state.capNegotiation.enabled = false;
+            this.completeAuthentication();
+          }
+        }
+        return {
+          id,
+          timestamp,
+          type: "notice",
+          message: trailing,
+          raw: line,
+        };
       case "002": // RPL_YOURHOST
       case "003": // RPL_CREATED
       case "004": // RPL_MYINFO
@@ -953,8 +1204,10 @@ export class IRCConnection {
     }
 
     // Convert Map to plain object for storage
+    // Exclude socket and other runtime-only objects that can't be cloned
+    const { socket, capNegotiation, ...stateWithoutRuntime } = this.state;
     const stateToSave: any = {
-      ...this.state,
+      ...stateWithoutRuntime,
       channels: Object.fromEntries(
         Array.from(this.state.channels.entries()).map(([name, channel]) => {
           const messageCount = channel.messages.length;

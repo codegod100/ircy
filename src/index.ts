@@ -21,6 +21,11 @@ app.post("/api/connect", async (c) => {
     username?: string;
     realname?: string;
     password?: string;
+    sasl?: {
+      mechanism: string;
+      username?: string;
+      password?: string;
+    };
     connectionId?: string;
     keepAlive?: boolean; // If true, prevents hibernation (~324k GB-s/month, within free tier)
   };

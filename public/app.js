@@ -65,6 +65,13 @@ class IRCClient {
       serverInput.style.display = 'none';
     }
 
+    // SASL checkbox handler
+    const useSaslCheckbox = document.getElementById('useSaslCheckbox');
+    const saslFields = document.getElementById('saslFields');
+    useSaslCheckbox.addEventListener('change', (e) => {
+      saslFields.style.display = e.target.checked ? 'block' : 'none';
+    });
+
     // Save form values on input change
     const formInputs = ['serverInput', 'portInput', 'nickInput', 'usernameInput', 'realnameInput'];
     formInputs.forEach(id => {
@@ -106,9 +113,18 @@ class IRCClient {
     const username = document.getElementById('usernameInput').value || nick;
     const realname = document.getElementById('realnameInput').value || nick;
     const password = document.getElementById('passwordInput').value;
+    const useSasl = document.getElementById('useSaslCheckbox').checked;
+    const saslMechanism = document.getElementById('saslMechanism').value;
+    const saslUsername = document.getElementById('saslUsername').value;
+    const saslPassword = document.getElementById('saslPassword').value;
 
     if (!server || !nick) {
       alert('Server and Nickname are required');
+      return;
+    }
+
+    if (useSasl && (!saslUsername || !saslPassword)) {
+      alert('SASL Username and Password are required when using SASL');
       return;
     }
 
@@ -116,17 +132,28 @@ class IRCClient {
     this.saveFormValues();
 
     try {
+      const connectBody = {
+        server,
+        port,
+        nick,
+        username,
+        realname,
+        password: password || undefined,
+      };
+
+      // Add SASL if enabled
+      if (useSasl) {
+        connectBody.sasl = {
+          mechanism: saslMechanism,
+          username: saslUsername,
+          password: saslPassword,
+        };
+      }
+
       const response = await fetch('/api/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          server,
-          port,
-          nick,
-          username,
-          realname,
-          password: password || undefined,
-        }),
+        body: JSON.stringify(connectBody),
       });
 
       // Clone the response to read it multiple times if needed
@@ -713,6 +740,21 @@ class IRCClient {
         statusEl.textContent = 'Connected';
         statusEl.className = 'connection-status connected';
       }
+      // Update connectionId if provided
+      if (connectionId) {
+        existing.dataset.connectionId = connectionId;
+        // Ensure delete button has the correct handler
+        const deleteBtn = existing.querySelector('.connection-delete-btn');
+        if (deleteBtn) {
+          // Remove old listeners by cloning
+          const newDeleteBtn = deleteBtn.cloneNode(true);
+          deleteBtn.replaceWith(newDeleteBtn);
+          newDeleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.deleteConnection(connectionId, existing);
+          });
+        }
+      }
       // Update active state
       const connectionsList = document.getElementById('connectionsList');
       Array.from(connectionsList.children).forEach(el => {
@@ -728,8 +770,11 @@ class IRCClient {
       connectionEl.dataset.connectionId = connectionId;
     }
     connectionEl.innerHTML = `
-      <div class="connection-name">${this.escapeHtml(server)}</div>
-      <div class="connection-status connected">Connected</div>
+      <div class="connection-info">
+        <div class="connection-name">${this.escapeHtml(server)}</div>
+        <div class="connection-status connected">Connected</div>
+      </div>
+      <button class="connection-delete-btn" title="Delete connection" aria-label="Delete connection">×</button>
     `;
     
     // Update active state - only one connection should be active
@@ -737,9 +782,10 @@ class IRCClient {
       el.classList.remove('active');
     });
     
-    // Add click handler to switch to this connection
-    if (connectionId) {
-      connectionEl.addEventListener('click', () => {
+    // Add click handler to switch to this connection (but not on delete button)
+    const connectionInfo = connectionEl.querySelector('.connection-info');
+    if (connectionId && connectionInfo) {
+      connectionInfo.addEventListener('click', () => {
         if (connectionId !== this.connectionId) {
           // Switch to this connection
           this.switchConnection(connectionId);
@@ -747,7 +793,79 @@ class IRCClient {
       });
     }
     
+    // Add delete button handler
+    const deleteBtn = connectionEl.querySelector('.connection-delete-btn');
+    if (deleteBtn && connectionId) {
+      deleteBtn.addEventListener('click', (e) => {
+        e.stopPropagation(); // Prevent triggering the connection switch
+        this.deleteConnection(connectionId, connectionEl);
+      });
+    }
+    
     connectionsList.appendChild(connectionEl);
+  }
+
+  async deleteConnection(connectionId, connectionEl) {
+    if (!confirm(`Are you sure you want to delete this connection?`)) {
+      return;
+    }
+
+    try {
+      // Try to disconnect from the server
+      try {
+        await fetch(`/api/${connectionId}/disconnect`, {
+          method: 'POST',
+        });
+      } catch (error) {
+        // Ignore disconnect errors - connection might already be dead
+        console.log('Disconnect error (ignored):', error);
+      }
+
+      // Remove from localStorage if it's the current connection
+      const saved = localStorage.getItem('ircCurrentConnection');
+      if (saved) {
+        const connectionInfo = JSON.parse(saved);
+        if (connectionInfo.connectionId === connectionId) {
+          localStorage.removeItem('ircCurrentConnection');
+          
+          // If this was the active connection, clear the UI
+          if (this.connectionId === connectionId) {
+            // Close WebSocket
+            if (this.ws) {
+              this.ws.close();
+              this.ws = null;
+            }
+            
+            // Clear state
+            this.connectionId = null;
+            this.channels.clear();
+            this.currentChannel = null;
+            
+            // Clear UI
+            document.getElementById('channelList').innerHTML = '';
+            document.getElementById('messagesContainer').innerHTML = '';
+            document.getElementById('currentChannel').textContent = 'Not Connected';
+            document.getElementById('messageInput').disabled = true;
+            document.getElementById('sendBtn').disabled = true;
+            document.getElementById('userlistContainer').style.display = 'none';
+          }
+        }
+      }
+
+      // Remove from UI
+      connectionEl.remove();
+
+      // Update active state if needed
+      const connectionsList = document.getElementById('connectionsList');
+      const remainingConnections = Array.from(connectionsList.children);
+      if (remainingConnections.length > 0 && !remainingConnections.some(el => el.classList.contains('active'))) {
+        // If no active connection, make the first one active
+        remainingConnections[0].classList.add('active');
+      }
+    } catch (error) {
+      console.error('Error deleting connection:', error);
+      alert('Failed to delete connection: ' + error.message);
+    }
   }
 
   async switchConnection(connectionId) {

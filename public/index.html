@@ -38,6 +38,19 @@
         <input type="text" id="usernameInput" placeholder="Username (optional)">
         <input type="text" id="realnameInput" placeholder="Real Name (optional)">
         <input type="password" id="passwordInput" placeholder="Password (optional)">
+        <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+          <label style="display: flex; align-items: center; margin-bottom: 8px; font-size: 14px;">
+            <input type="checkbox" id="useSaslCheckbox" style="margin-right: 8px;">
+            Use SASL Authentication
+          </label>
+          <div id="saslFields" style="display: none;">
+            <select id="saslMechanism" style="width: 100%; padding: 8px 12px; margin-bottom: 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 14px;">
+              <option value="PLAIN">PLAIN</option>
+            </select>
+            <input type="text" id="saslUsername" placeholder="SASL Username" style="width: 100%; padding: 8px 12px; margin-bottom: 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 14px;">
+            <input type="password" id="saslPassword" placeholder="SASL Password" style="width: 100%; padding: 8px 12px; margin-bottom: 8px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); font-size: 14px;">
+          </div>
+        </div>
         <div class="form-actions">
           <button class="btn btn-primary" id="connectBtn">Connect</button>
           <button class="btn btn-secondary" id="cancelBtn">Cancel</button>
