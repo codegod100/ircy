@@ -48,6 +48,38 @@ export class IRCConnection {
 
   constructor(private ctx: DurableObjectState, private env: Env) {}
 
+  private async ensureStateLoaded(): Promise<void> {
+    if (this.state !== null) return; // Already loaded
+
+    // Try to load state from storage
+    const stored = await this.ctx.storage.get<any>("state");
+    if (stored) {
+      // Convert plain object back to Map and reconstruct IRCChannel objects
+      const channelsMap = new Map<string, IRCChannel>();
+      if (stored.channels) {
+        for (const [name, channelData] of Object.entries(stored.channels)) {
+          const channel = channelData as any;
+          const messageCount = channel.messages?.length || 0;
+          console.log(`Loading channel ${name} with ${messageCount} messages`);
+          channelsMap.set(name, {
+            name: channel.name || name,
+            messages: channel.messages || [],
+            topic: channel.topic,
+            users: channel.users || [],
+          });
+        }
+      }
+      
+      this.state = {
+        ...stored,
+        channels: channelsMap,
+        buffer: stored.buffer || [],
+        socket: undefined, // Don't restore socket connection
+      };
+      console.log(`Loaded state from storage: ${channelsMap.size} channels, ${stored.buffer?.length || 0} buffer messages`);
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -77,6 +109,9 @@ export class IRCConnection {
   }
 
   private async handleWebSocket(request: Request): Promise<Response> {
+    // Ensure state is loaded before handling WebSocket
+    await this.ensureStateLoaded();
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
 
@@ -85,12 +120,21 @@ export class IRCConnection {
     console.log(`WebSocket added. Total WebSockets: ${this.websockets.size}`);
 
     // If we have a connection request pending and this is the first WebSocket, start IRC connection
-    if (this.state && !this.state.connected && !this.ircConnectionStarted && this.websockets.size === 1) {
-      console.log('First WebSocket connected, starting IRC connection now');
-      this.ircConnectionStarted = true;
-      this.connectToIRC().catch((error) => {
-        this.broadcast({ type: "error", error: String(error) });
-      });
+    // Also reconnect if IRC connection was lost
+    if (this.state && !this.state.connected && this.websockets.size === 1) {
+      // Reset connection started flag if connection was lost
+      if (!this.state.connected) {
+        this.ircConnectionStarted = false;
+      }
+      
+      if (!this.ircConnectionStarted) {
+        console.log('First WebSocket connected, starting IRC connection now');
+        this.ircConnectionStarted = true;
+        this.connectToIRC().catch((error) => {
+          this.broadcast({ type: "error", error: String(error) });
+          this.ircConnectionStarted = false; // Reset on error so we can retry
+        });
+      }
     }
 
     server.addEventListener("close", () => {
@@ -109,22 +153,37 @@ export class IRCConnection {
         type: "state",
         state: this.serializeState()
       }));
+
+      // Send all channel messages to restore full history
+      for (const [channelName, channel] of this.state.channels.entries()) {
+        const messages = channel.messages || [];
+        console.log(`Sending ${messages.length} messages for channel ${channelName}`, messages.map(m => ({ id: m.id, user: m.user, message: m.message?.substring(0, 20) })));
+        // Send channel history restoration message
+        server.send(JSON.stringify({
+          type: "channel_history",
+          channel: channelName,
+          messages: messages.slice(-500), // Send last 500 messages per channel
+        }));
+      }
+
+      // Send buffered messages (non-channel messages) to new client (last 100 messages)
+      const recentMessages = this.messageBuffer.slice(-100);
+      for (const msg of recentMessages) {
+        try {
+          // Only send non-channel messages from buffer (channel messages are sent above)
+          if (msg.type !== "message" || !msg.message?.channel) {
+            server.send(JSON.stringify(msg));
+          }
+        } catch (e) {
+          // Ignore errors
+        }
+      }
     } else {
       // Send initial connection status
       server.send(JSON.stringify({
         type: "status",
         message: "Waiting for connection..."
       }));
-    }
-
-    // Send buffered messages to new client (last 100 messages)
-    const recentMessages = this.messageBuffer.slice(-100);
-    for (const msg of recentMessages) {
-      try {
-        server.send(JSON.stringify(msg));
-      } catch (e) {
-        // Ignore errors
-      }
     }
 
     return new Response(null, {
@@ -151,7 +210,15 @@ export class IRCConnection {
         const channelsMap = new Map<string, IRCChannel>();
         if (stored.channels) {
           for (const [name, channelData] of Object.entries(stored.channels)) {
-            channelsMap.set(name, channelData as IRCChannel);
+            const channel = channelData as any;
+            const messageCount = channel.messages?.length || 0;
+            console.log(`handleConnect: Loading channel ${name} with ${messageCount} messages`);
+            channelsMap.set(name, {
+              name: channel.name || name,
+              messages: channel.messages || [],
+              topic: channel.topic,
+              users: channel.users || [],
+            });
           }
         }
         
@@ -160,6 +227,7 @@ export class IRCConnection {
           channels: channelsMap,
           buffer: stored.buffer || [],
         };
+        console.log(`handleConnect: Loaded state with ${channelsMap.size} channels`);
       } else {
         this.state = {
           server: body.server,
@@ -222,7 +290,43 @@ export class IRCConnection {
     }
 
     if (body.channel) {
+      // Send the PRIVMSG
       this.sendIRC(`PRIVMSG ${body.channel} :${body.message}`);
+      
+      // Create optimistic message in case server echo doesn't arrive
+      // The server echo will replace this if it arrives
+      const optimisticMessage: IRCMessage = {
+        id: `optimistic-${Date.now()}-${Math.random()}`,
+        timestamp: Date.now(),
+        type: "message",
+        channel: body.channel,
+        user: this.state.nick, // Use our own nick for optimistic message
+        message: body.message,
+        raw: `PRIVMSG ${body.channel} :${body.message}`,
+      };
+      
+      // Add to channel immediately (server echo will update if it arrives)
+      if (!this.state.channels.has(body.channel)) {
+        this.state.channels.set(body.channel, {
+          name: body.channel,
+          messages: [],
+          users: [],
+        });
+      }
+      const channel = this.state.channels.get(body.channel)!;
+      channel.messages.push(optimisticMessage);
+      if (channel.messages.length > 1000) {
+        channel.messages.shift();
+      }
+      
+      // Broadcast optimistic message
+      this.broadcast({ type: "message", message: optimisticMessage });
+      
+      // Save state immediately
+      this.state.lastActivity = Date.now();
+      this.saveState().catch(err => {
+        console.error('Error saving optimistic message:', err);
+      });
     } else {
       this.sendIRC(body.message);
     }
@@ -233,6 +337,8 @@ export class IRCConnection {
   }
 
   private async handleGetState(request: Request): Promise<Response> {
+    // Ensure state is loaded
+    await this.ensureStateLoaded();
     return new Response(JSON.stringify(this.serializeState()), {
       headers: { "Content-Type": "application/json" },
     });
@@ -322,6 +428,7 @@ export class IRCConnection {
       this.readFromSocket(reader).catch((error) => {
         console.error("Error reading from socket:", error);
         this.state!.connected = false;
+        this.ircConnectionStarted = false; // Reset flag so we can reconnect when WebSocket reconnects
         this.broadcast({ type: "error", error: `Socket read error: ${String(error)}` });
         this.broadcast({ type: "disconnected", message: "Disconnected from IRC server" });
         this.saveState();
@@ -331,11 +438,13 @@ export class IRCConnection {
       socket.closed.then(() => {
         console.log("Socket closed");
         this.state!.connected = false;
+        this.ircConnectionStarted = false; // Reset flag so we can reconnect when WebSocket reconnects
         this.broadcast({ type: "disconnected", message: "Disconnected from IRC server" });
         this.saveState();
       }).catch((error) => {
         console.error("Socket closed with error:", error);
         this.state!.connected = false;
+        this.ircConnectionStarted = false; // Reset flag so we can reconnect when WebSocket reconnects
         this.broadcast({ type: "error", error: `Socket closed: ${String(error)}` });
         this.broadcast({ type: "disconnected", message: "Disconnected from IRC server" });
         this.saveState();
@@ -409,6 +518,11 @@ export class IRCConnection {
         continue;
       }
 
+      // Log all incoming IRC messages for debugging
+      if (line.includes("PRIVMSG")) {
+        console.log("IRC raw received (PRIVMSG):", line);
+      }
+
       const message = this.parseIRCMessage(line);
       if (message) {
         // Add to buffer
@@ -427,17 +541,73 @@ export class IRCConnection {
             });
           }
           const channel = this.state.channels.get(message.channel)!;
-          channel.messages.push(message);
-          if (channel.messages.length > 1000) {
-            channel.messages.shift();
+          
+          // Check if this is a duplicate (server echo of optimistic message)
+          // Look for optimistic message with same content and user within last 5 seconds
+          let replacedOptimistic = false;
+          let shouldBroadcast = true;
+          
+          for (let idx = channel.messages.length - 1; idx >= 0; idx--) {
+            const existingMsg = channel.messages[idx];
+            if (existingMsg.id?.startsWith('optimistic-') && 
+                existingMsg.user === message.user &&
+                existingMsg.message === message.message &&
+                Math.abs(existingMsg.timestamp - message.timestamp) < 5000) {
+              // Replace optimistic message with server echo
+              channel.messages[idx] = message;
+              replacedOptimistic = true;
+              shouldBroadcast = false; // Don't broadcast duplicate
+              break;
+            }
           }
+          
+          if (!replacedOptimistic) {
+            // Only add if not a duplicate of any existing message
+            const isDuplicate = channel.messages.some(existingMsg => 
+              existingMsg.user === message.user &&
+              existingMsg.message === message.message &&
+              Math.abs(existingMsg.timestamp - message.timestamp) < 2000
+            );
+            
+            if (!isDuplicate) {
+              channel.messages.push(message);
+              if (channel.messages.length > 1000) {
+                channel.messages.shift();
+              }
+            } else {
+              shouldBroadcast = false; // Don't broadcast duplicate
+            }
+          }
+          
+          console.log(`Added message to channel ${message.channel}, total messages: ${channel.messages.length}`, {
+            user: message.user,
+            message: message.message?.substring(0, 30),
+            id: message.id,
+            replacedOptimistic
+          });
+          
+          // Save state immediately for channel messages to ensure persistence
+          this.state.lastActivity = Date.now();
+          this.saveState().then(() => {
+            console.log(`State saved after adding message to ${message.channel}, channel now has ${channel.messages.length} messages`);
+          }).catch(err => {
+            console.error('Error saving state:', err);
+          });
+          
+          // Broadcast only if not a duplicate
+          if (shouldBroadcast) {
+            this.broadcast({ type: "message", message: message });
+          }
+        } else {
+          this.state.lastActivity = Date.now();
+          // Save state for non-channel messages too, but less frequently
+          this.saveState().catch(err => {
+            console.error('Error saving state:', err);
+          });
+          
+          // Broadcast to WebSocket clients
+          this.broadcast({ type: "message", message: message });
         }
-
-        // Broadcast to WebSocket clients
-        this.broadcast({ type: "message", message: message });
-
-        this.state.lastActivity = Date.now();
-        this.saveState();
       }
     }
   }
@@ -620,25 +790,45 @@ export class IRCConnection {
     };
   }
 
+  private saveStatePromise: Promise<void> | null = null;
+
   private async saveState(): Promise<void> {
     if (!this.state) return;
+
+    // If a save is already in progress, wait for it and then save again
+    if (this.saveStatePromise) {
+      await this.saveStatePromise;
+    }
 
     // Convert Map to plain object for storage
     const stateToSave: any = {
       ...this.state,
       channels: Object.fromEntries(
-        Array.from(this.state.channels.entries()).map(([name, channel]) => [
-          name,
-          {
-            ...channel,
-            messages: channel.messages.slice(-500), // Keep last 500 messages
-          },
-        ])
+        Array.from(this.state.channels.entries()).map(([name, channel]) => {
+          const messageCount = channel.messages.length;
+          console.log(`Saving channel ${name} with ${messageCount} messages`);
+          return [
+            name,
+            {
+              ...channel,
+              messages: channel.messages.slice(-500), // Keep last 500 messages
+            },
+          ];
+        })
       ),
       buffer: this.state.buffer.slice(-500), // Keep last 500 messages
     };
 
-    await this.ctx.storage.put("state", stateToSave);
+    this.saveStatePromise = this.ctx.storage.put("state", stateToSave).then(() => {
+      console.log(`State saved: ${Object.keys(stateToSave.channels).length} channels`);
+      this.saveStatePromise = null;
+    }).catch(err => {
+      console.error('Error saving state:', err);
+      this.saveStatePromise = null;
+      throw err;
+    });
+
+    return this.saveStatePromise;
   }
 }
 
